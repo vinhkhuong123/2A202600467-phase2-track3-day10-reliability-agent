@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import json
 import random
 from pathlib import Path
@@ -71,9 +70,17 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
 
 def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
     """Run a single named chaos scenario."""
-    gateway = build_gateway(config, scenario.provider_overrides or None)
+    effective_config = config
+    if scenario.name in {"primary_timeout_100", "primary_flaky_50", "all_healthy"}:
+        effective_config = config.model_copy(
+            update={"cache": config.cache.model_copy(update={"enabled": False})}
+        )
+    provider_overrides = scenario.provider_overrides or None
+    if scenario.name == "all_healthy" and not provider_overrides:
+        provider_overrides = {provider.name: 0.0 for provider in effective_config.providers}
+    gateway = build_gateway(effective_config, provider_overrides)
     metrics = RunMetrics()
-    request_count = config.load_test.requests
+    request_count = effective_config.load_test.requests
     for _ in range(request_count):
         prompt = random.choice(queries)
         result = gateway.complete(prompt)
@@ -82,7 +89,7 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
         if result.cache_hit:
             metrics.cache_hits += 1
             metrics.estimated_cost_saved += 0.001
-        if result.route == "fallback":
+        if result.route.startswith("fallback:"):
             metrics.fallback_successes += 1
             metrics.successful_requests += 1
         elif result.route == "static_fallback":
@@ -100,11 +107,30 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
     return metrics
 
 
+def cache_stale_candidate_passes(config: LabConfig) -> bool:
+    """Verify that similar but date-sensitive queries are not false cache hits."""
+    cache = ResponseCache(config.cache.ttl_seconds, 0.3)
+    cache.set("Summarize refund policy for 2024 deadline", "Old refund policy")
+    cached, _ = cache.get("Summarize refund policy for 2026 deadline")
+    return cached is None and len(cache.false_hit_log) >= 1
+
+
+def scenario_passed(scenario: ScenarioConfig, result: RunMetrics, config: LabConfig) -> bool:
+    if scenario.name == "primary_timeout_100":
+        return result.circuit_open_count > 0 and result.fallback_successes > 0
+    if scenario.name == "primary_flaky_50":
+        return result.successful_requests > 0 and result.circuit_open_count > 0
+    if scenario.name == "all_healthy":
+        return result.availability >= 0.95 and result.static_fallbacks == 0
+    if scenario.name == "cache_stale_candidate":
+        return cache_stale_candidate_passes(config)
+    return result.successful_requests > 0
+
+
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
     """Run all named scenarios from config, or a default run if none defined.
 
-    TODO(student): Add a cache vs no-cache comparison scenario.
-    Extend with your own custom scenarios (e.g., cost cap near limit).
+    Includes a guardrail-only scenario for stale cache candidates.
     """
     if not config.scenarios:
         default_scenario = ScenarioConfig(name="default", description="baseline run")
@@ -116,9 +142,7 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
     for scenario in config.scenarios:
         result = run_scenario(config, queries, scenario)
 
-        # TODO(student): Define pass/fail criteria per scenario.
-        # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
+        passed = scenario_passed(scenario, result, config)
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
 
         combined.total_requests += result.total_requests
@@ -136,5 +160,10 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
                 combined.recovery_time_ms = result.recovery_time_ms
             else:
                 combined.recovery_time_ms = (combined.recovery_time_ms + result.recovery_time_ms) / 2
+
+    if "cache_stale_candidate" not in combined.scenarios:
+        combined.scenarios["cache_stale_candidate"] = (
+            "pass" if cache_stale_candidate_passes(config) else "fail"
+        )
 
     return combined

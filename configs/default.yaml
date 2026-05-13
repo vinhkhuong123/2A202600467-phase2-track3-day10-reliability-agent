@@ -34,3 +34,6 @@ scenarios:
   - name: all_healthy
     description: "Baseline — both providers healthy"
     provider_overrides: {}
+  - name: cache_stale_candidate
+    description: "Similar date-sensitive refund policy queries should not false-hit cache"
+    provider_overrides: {}
